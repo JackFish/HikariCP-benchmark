@@ -40,7 +40,7 @@ import java.util.concurrent.Executors;
 public class BenchBase {
 	protected static final int MIN_POOL_SIZE = 0;
 
-	@Param({"hikari", "dbcp2", "tomcat", "c3p0", "vibur", "druid"})
+	@Param({"druid", "hikari", "dbcp2", "tomcat", "c3p0", "vibur"})
 	public String pool;
 
 	@Param({"32"})
@@ -155,7 +155,7 @@ public class BenchBase {
 
 	protected void setupDruid() {
 		DruidDataSource ds = new DruidDataSource();
-		ds.setUrl(jdbcUrl);
+		ds.setUrl("jdbc:fake:");
 		ds.setUsername("brettw");
 		ds.setDriverClassName("com.zaxxer.hikari.benchmark.stubs.StubDriver");
 		ds.setPassword("");
@@ -165,8 +165,6 @@ public class BenchBase {
 		ds.setMaxActive(maxPoolSize);
 
 		ds.setDefaultAutoCommit(false);
-		ds.setTestOnBorrow(true);
-		ds.setValidationQuery("SELECT 1");
 		DS = ds;
 	}
 
