@@ -1,35 +1,14 @@
 package com.zaxxer.hikari.benchmark;
 
-import static com.zaxxer.hikari.util.ConcurrentBag.IConcurrentBagEntry.STATE_IN_USE;
-import static com.zaxxer.hikari.util.ConcurrentBag.IConcurrentBagEntry.STATE_NOT_IN_USE;
-import static com.zaxxer.hikari.util.UtilityElf.quietlySleep;
-import static java.lang.Integer.parseInt;
-import static java.lang.System.nanoTime;
-import static java.lang.Thread.MAX_PRIORITY;
-import static java.lang.Thread.currentThread;
-import static java.util.concurrent.TimeUnit.MILLISECONDS;
-import static java.util.concurrent.TimeUnit.MINUTES;
-import static java.util.concurrent.TimeUnit.NANOSECONDS;
-import static java.util.concurrent.TimeUnit.SECONDS;
-
-import java.lang.reflect.Field;
-import java.sql.Connection;
-import java.sql.DriverManager;
-import java.sql.ResultSet;
-import java.sql.SQLException;
-import java.sql.Statement;
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Timer;
-import java.util.TimerTask;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.concurrent.atomic.LongAdder;
-import java.util.stream.IntStream;
-
-import javax.sql.DataSource;
-
+import com.alibaba.druid.pool.DruidDataSource;
+import com.alibaba.druid.pool.DruidDataSourceStatValue;
+import com.mchange.v2.c3p0.ComboPooledDataSource;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+import com.zaxxer.hikari.benchmark.stubs.StubDriver;
+import com.zaxxer.hikari.benchmark.stubs.StubStatement;
+import com.zaxxer.hikari.pool.HikariPool;
+import com.zaxxer.hikari.pool.HikariPoolAccessor;
 import org.apache.commons.dbcp2.BasicDataSource;
 import org.apache.commons.dbcp2.DbcpPoolAccessor;
 import org.apache.commons.dbcp2.TomcatPoolAccessor;
@@ -43,119 +22,133 @@ import org.vibur.dbcp.pool.Hook.CloseConnection;
 import org.vibur.dbcp.pool.Hook.GetConnection;
 import org.vibur.dbcp.pool.Hook.InitConnection;
 
-import com.mchange.v2.c3p0.ComboPooledDataSource;
-import com.zaxxer.hikari.HikariConfig;
-import com.zaxxer.hikari.HikariDataSource;
-import com.zaxxer.hikari.benchmark.stubs.StubDriver;
-import com.zaxxer.hikari.benchmark.stubs.StubStatement;
-import com.zaxxer.hikari.pool.HikariPool;
-import com.zaxxer.hikari.pool.HikariPoolAccessor;
+import javax.sql.DataSource;
+import java.lang.reflect.Field;
+import java.sql.*;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.LongAdder;
+import java.util.stream.IntStream;
 
-public class SpikeLoadTest
-{
-   private static final Logger LOGGER = LoggerFactory.getLogger(SpikeLoadTest.class);
+import static com.zaxxer.hikari.util.ConcurrentBag.IConcurrentBagEntry.STATE_IN_USE;
+import static com.zaxxer.hikari.util.ConcurrentBag.IConcurrentBagEntry.STATE_NOT_IN_USE;
+import static com.zaxxer.hikari.util.UtilityElf.quietlySleep;
+import static java.lang.Integer.parseInt;
+import static java.lang.System.nanoTime;
+import static java.lang.Thread.MAX_PRIORITY;
+import static java.lang.Thread.currentThread;
+import static java.util.concurrent.TimeUnit.*;
 
-   public static final String jdbcUrl = "jdbc:stub";
+public class SpikeLoadTest {
+	private static final Logger LOGGER = LoggerFactory.getLogger(SpikeLoadTest.class);
 
-   private static final int MIN_POOL_SIZE = 5;
-   private static final int MAX_POOL_SIZE = 50;
+	public static final String jdbcUrl = "jdbc:stub";
 
-   private DataSource DS;
+	private static final int MIN_POOL_SIZE = 5;
+	private static final int MAX_POOL_SIZE = 50;
 
-   private int requestCount;
+	private DataSource DS;
 
-   private String pool;
+	private int requestCount;
 
-   private DbcpPoolAccessor dbcpPool;
+	private String pool;
 
-   private ViburPoolHooks viburPool;
+	private DbcpPoolAccessor dbcpPool;
 
-   private HikariPoolAccessor hikariPoolAccessor;
+	private ViburPoolHooks viburPool;
 
-   private AtomicInteger threadsRemaining;
+	private HikariPoolAccessor hikariPoolAccessor;
 
-   private AtomicInteger threadsPending;
+	private AtomicInteger threadsRemaining;
 
-   private ComboPooledDataSource c3p0;
+	private AtomicInteger threadsPending;
 
-   private TomcatPoolAccessor tomcat;
+	private ComboPooledDataSource c3p0;
 
-   public static void main(String[] args) throws InterruptedException
-   {
-      SpikeLoadTest test = new SpikeLoadTest();
+	private TomcatPoolAccessor tomcat;
 
-      test.setup(args);
+	private DruidDataSource druidDataSource;
 
-      test.start(parseInt(args[0]));
-   }
+	public static void main(String[] args) throws InterruptedException {
+		SpikeLoadTest test = new SpikeLoadTest();
 
-   private void setup(String[] args)
-   {
-      try {
-         Class.forName("com.zaxxer.hikari.benchmark.stubs.StubDriver");
-         StubDriver driver = (StubDriver) DriverManager.getDriver(jdbcUrl);
-         LOGGER.info("Using driver ({}): {}", jdbcUrl, driver);
-      }
-      catch (Exception e) {
-         throw new RuntimeException(e);
-      }
+		test.setup(args);
 
-      pool = args[1];
-      IntStream.of(0, 1).forEach( i -> {
-         switch (pool) {
-         case "hikari":
-            setupHikari();
-            hikariPoolAccessor = new HikariPoolAccessor(getHikariPool(DS));
-            break;
-         case "dbcp2":
-            setupDbcp2();
-            dbcpPool = (DbcpPoolAccessor) DS;
-            break;
-         case "c3p0":
-            setupC3P0();
-            c3p0 = (ComboPooledDataSource) DS;
-            break;
-         case "tomcat":
-            setupTomcat();
-            tomcat = (TomcatPoolAccessor) DS;
-            break;
-         case "vibur":
-            setupVibur();
-            break;
-         default:
-            throw new IllegalArgumentException("Unknown connection pool specified");
-         }
+		test.start(parseInt(args[0]));
+	}
 
-         if (i == 0) {
-            try {
-               LOGGER.info("Warming up pool...");
-               LOGGER.info("Warmup blackhole {}", warmupPool());
-               shutdownPool(DS);
-            }
-            catch (InterruptedException e) {
-            }
-         }
-      });
+	private void setup(String[] args) {
+		try {
+			Class.forName("com.zaxxer.hikari.benchmark.stubs.StubDriver");
+			StubDriver driver = (StubDriver) DriverManager.getDriver(jdbcUrl);
+			LOGGER.info("Using driver ({}): {}", jdbcUrl, driver);
+		} catch (Exception e) {
+			throw new RuntimeException(e);
+		}
 
-      quietlySleep(SECONDS.toMillis(2));
+		pool = args[1];
+		IntStream.of(0, 1).forEach(i -> {
+			switch (pool) {
+				case "hikari":
+					setupHikari();
+					hikariPoolAccessor = new HikariPoolAccessor(getHikariPool(DS));
+					break;
+				case "dbcp2":
+					setupDbcp2();
+					dbcpPool = (DbcpPoolAccessor) DS;
+					break;
+				case "c3p0":
+					setupC3P0();
+					c3p0 = (ComboPooledDataSource) DS;
+					break;
+				case "tomcat":
+					setupTomcat();
+					tomcat = (TomcatPoolAccessor) DS;
+					break;
+				case "vibur":
+					setupVibur();
+					break;
+				case "druid":
+					setupDruid();
+					druidDataSource = (DruidDataSource) DS;
+					break;
+				default:
+					throw new IllegalArgumentException("Unknown connection pool specified");
+			}
 
-      this.requestCount = parseInt(args[2]);
-   }
+			if (i == 0) {
+				try {
+					LOGGER.info("Warming up pool...");
+					LOGGER.info("Warmup blackhole {}", warmupPool());
+					shutdownPool(DS);
+				} catch (InterruptedException e) {
+				}
+			}
+		});
 
-   private void start(int connectDelay) throws InterruptedException
-   {
-      List<RequestThread> list = new ArrayList<>();
-      for (int i = 0; i < requestCount; i++) {
-         RequestThread rt = new RequestThread();
-         list.add(rt);
-      }
+		quietlySleep(SECONDS.toMillis(2));
 
-      StubDriver.setConnectDelayMs(connectDelay);
-      StubStatement.setExecuteDelayMs(2L);
+		this.requestCount = parseInt(args[2]);
+	}
 
-      Timer timer = new Timer(true);
-      ExecutorService executor = Executors.newFixedThreadPool(50); /*, new ThreadFactory() {
-         @Override
+	private void start(int connectDelay) throws InterruptedException {
+		List<RequestThread> list = new ArrayList<>();
+		for (int i = 0; i < requestCount; i++) {
+			RequestThread rt = new RequestThread();
+			list.add(rt);
+		}
+
+		StubDriver.setConnectDelayMs(connectDelay);
+		StubStatement.setExecuteDelayMs(2L);
+
+		Timer timer = new Timer(true);
+		ExecutorService executor = Executors.newFixedThreadPool(50); /*, new ThreadFactory() {
+		 @Override
          public Thread newThread(Runnable r)
          {
             Thread t = new Thread(r);
@@ -164,419 +157,404 @@ public class SpikeLoadTest
          }
       }); */
 
-      quietlySleep(SECONDS.toMillis(3));
+		quietlySleep(SECONDS.toMillis(3));
 
-      threadsRemaining = new AtomicInteger(requestCount);
-      threadsPending = new AtomicInteger(0);
+		threadsRemaining = new AtomicInteger(requestCount);
+		threadsPending = new AtomicInteger(0);
 
-      LOGGER.info("SpikeLoadTest starting.");
+		LOGGER.info("SpikeLoadTest starting.");
 
-      currentThread().setPriority(MAX_PRIORITY);
+		currentThread().setPriority(MAX_PRIORITY);
 
-      timer.schedule(new TimerTask() {
-         public void run() {
-            for (int i = 0; i < requestCount; i++) {
-               final Runnable runner = list.get(i);
-                  executor.execute(runner);
-               }
-            }
-         }, 1);
+		timer.schedule(new TimerTask() {
+			public void run() {
+				for (int i = 0; i < requestCount; i++) {
+					final Runnable runner = list.get(i);
+					executor.execute(runner);
+				}
+			}
+		}, 1);
 
-      final long startTime = nanoTime();
+		final long startTime = nanoTime();
 
-      List<PoolStatistics> statsList = new ArrayList<>();
-      PoolStatistics poolStatistics;
-      do {
-         poolStatistics = getPoolStatistics(startTime, threadsPending.get());
-         statsList.add(poolStatistics);
+		List<PoolStatistics> statsList = new ArrayList<>();
+		PoolStatistics poolStatistics;
+		do {
+			poolStatistics = getPoolStatistics(startTime, threadsPending.get());
+			statsList.add(poolStatistics);
 
-         final long spinStart = nanoTime();
-         do {
-            // spin
-         } while (nanoTime() - spinStart < 250_000 /* 0.1ms */);
-      }
-      while (threadsRemaining.get() > 0  || poolStatistics.activeConnections > 0);
+			final long spinStart = nanoTime();
+			do {
+				// spin
+			} while (nanoTime() - spinStart < 250_000 /* 0.1ms */);
+		}
+		while (threadsRemaining.get() > 0 || poolStatistics.activeConnections > 0);
 
-      long endTime = nanoTime();
+		long endTime = nanoTime();
 
-      executor.shutdown();
+		executor.shutdown();
 
-      LOGGER.info("SpikeLoadTest completed in {}ms", MILLISECONDS.convert(endTime - startTime, NANOSECONDS));
+		LOGGER.info("SpikeLoadTest completed in {}ms", MILLISECONDS.convert(endTime - startTime, NANOSECONDS));
 
-      dumpStats(statsList, list);
-   }
+		dumpStats(statsList, list);
+	}
 
-   private void dumpStats(List<PoolStatistics> statsList, List<RequestThread> list)
-   {
-      System.out.println(String.join("\t", "Time", "Total", "Active", "Idle", "Wait"));
-      for (PoolStatistics stats : statsList) {
-         System.out.println(stats);
-      }
+	private void dumpStats(List<PoolStatistics> statsList, List<RequestThread> list) {
+		System.out.println(String.join("\t", "Time", "Total", "Active", "Idle", "Wait"));
+		for (PoolStatistics stats : statsList) {
+			System.out.println(stats);
+		}
 
-      System.out.println("\n" + String.join("\t", "Total", "Conn", "Query", "Thread"));
-      for (RequestThread req : list) {
-         System.out.println(req);
-      }
-   }
+		System.out.println("\n" + String.join("\t", "Total", "Conn", "Query", "Thread"));
+		for (RequestThread req : list) {
+			System.out.println(req);
+		}
+	}
 
-   private class RequestThread extends TimerTask implements Runnable
-   {
-      @SuppressWarnings("unused")
-      Exception exception;
-      String name;
-      long startTime;
-      long endTime;
-      long connectTime;
-      long queryTime;
+	private class RequestThread extends TimerTask implements Runnable {
+		@SuppressWarnings("unused")
+		Exception exception;
+		String name;
+		long startTime;
+		long endTime;
+		long connectTime;
+		long queryTime;
 
-      @Override
-      public void run()
-      {
-         name = currentThread().getName();
+		@Override
+		public void run() {
+			name = currentThread().getName();
 
-         threadsPending.incrementAndGet();
-         startTime = nanoTime();
-         try (Connection connection = DS.getConnection()) {
-            connectTime = nanoTime();
-            threadsPending.decrementAndGet();
-            try (Statement statement = connection.createStatement();
-                 ResultSet resultSet = statement.executeQuery("SELECT x FROM faux")) {
-               queryTime = nanoTime();
-            }
-         }
-         catch (SQLException e) {
-            exception = e;
-         }
-         finally {
-            endTime = nanoTime();
-            threadsRemaining.decrementAndGet();
-         }
-      }
+			threadsPending.incrementAndGet();
+			startTime = nanoTime();
+			try (Connection connection = DS.getConnection()) {
+				connectTime = nanoTime();
+				threadsPending.decrementAndGet();
+				try (Statement statement = connection.createStatement();
+				     ResultSet resultSet = statement.executeQuery("SELECT x FROM faux")) {
+					queryTime = nanoTime();
+				}
+			} catch (SQLException e) {
+				exception = e;
+			} finally {
+				endTime = nanoTime();
+				threadsRemaining.decrementAndGet();
+			}
+		}
 
-      @Override
-      public String toString()
-      {
-         return String.format("%d\t%d\t%d\t%s",
-                              NANOSECONDS.toMicros(endTime - startTime),
-                              NANOSECONDS.toMicros(connectTime - startTime),
-                              NANOSECONDS.toMicros(queryTime - connectTime),
-                              name);
-      }
-   }
+		@Override
+		public String toString() {
+			return String.format("%d\t%d\t%d\t%s",
+					NANOSECONDS.toMicros(endTime - startTime),
+					NANOSECONDS.toMicros(connectTime - startTime),
+					NANOSECONDS.toMicros(queryTime - connectTime),
+					name);
+		}
+	}
 
-   private static class PoolStatistics
-   {
-      long timestamp = nanoTime();
-      int activeConnections;
-      int idleConnections;
-      int pendingThreads;
-      int totalConnections;
+	private static class PoolStatistics {
+		long timestamp = nanoTime();
+		int activeConnections;
+		int idleConnections;
+		int pendingThreads;
+		int totalConnections;
 
-      PoolStatistics(final long baseTime) {
-         timestamp = nanoTime() - baseTime;
-      }
+		PoolStatistics(final long baseTime) {
+			timestamp = nanoTime() - baseTime;
+		}
 
-      @Override
-      public String toString()
-      {
-         return String.format("%d\t%d\t%d\t%d\t%d", NANOSECONDS.toMicros(timestamp), totalConnections, activeConnections, idleConnections, pendingThreads);
-      }
-   }
+		@Override
+		public String toString() {
+			return String.format("%d\t%d\t%d\t%d\t%d", NANOSECONDS.toMicros(timestamp), totalConnections, activeConnections, idleConnections, pendingThreads);
+		}
+	}
 
-   private PoolStatistics getPoolStatistics(final long baseTime, int remaining)
-   {
-      PoolStatistics stats = new PoolStatistics(baseTime);
+	private PoolStatistics getPoolStatistics(final long baseTime, int remaining) {
+		PoolStatistics stats = new PoolStatistics(baseTime);
 
-      switch (pool) {
-      case "hikari":
-         final int[] poolStateCounts = hikariPoolAccessor.getPoolStateCounts();
-         stats.activeConnections = poolStateCounts[STATE_IN_USE];
-         stats.idleConnections = poolStateCounts[STATE_NOT_IN_USE];
-         stats.totalConnections = poolStateCounts[4];
-         stats.pendingThreads = remaining;
-         break;
-      case "dbcp2":
-         stats.activeConnections = dbcpPool.getNumActive();
-         stats.idleConnections = dbcpPool.getNumIdle();
-         stats.totalConnections = dbcpPool.getNumTotal();
-         stats.pendingThreads = remaining;
-         break;
-      case "tomcat":
-         stats.activeConnections = tomcat.getNumActive();
-         stats.idleConnections = tomcat.getNumIdle();
-         stats.totalConnections = tomcat.getNumTotal();
-         stats.pendingThreads = remaining;
-         break;
-      case "c3p0":
-         try {
-            stats.activeConnections = c3p0.getNumBusyConnectionsDefaultUser();
-            stats.idleConnections = c3p0.getNumIdleConnectionsDefaultUser();
-            stats.totalConnections = c3p0.getNumConnectionsDefaultUser();
-            stats.pendingThreads = remaining;
-         }
-         catch (SQLException e) {
-            throw new RuntimeException(e);
-         }
-         break;
-      case "vibur":
-         stats.activeConnections = viburPool.getActive();
-         stats.idleConnections = viburPool.getIdle();
-         stats.totalConnections = viburPool.getTotal();
-         stats.pendingThreads = remaining;
-         break;
-      }
+		switch (pool) {
+			case "hikari":
+				final int[] poolStateCounts = hikariPoolAccessor.getPoolStateCounts();
+				stats.activeConnections = poolStateCounts[STATE_IN_USE];
+				stats.idleConnections = poolStateCounts[STATE_NOT_IN_USE];
+				stats.totalConnections = poolStateCounts[4];
+				stats.pendingThreads = remaining;
+				break;
+			case "dbcp2":
+				stats.activeConnections = dbcpPool.getNumActive();
+				stats.idleConnections = dbcpPool.getNumIdle();
+				stats.totalConnections = dbcpPool.getNumTotal();
+				stats.pendingThreads = remaining;
+				break;
+			case "tomcat":
+				stats.activeConnections = tomcat.getNumActive();
+				stats.idleConnections = tomcat.getNumIdle();
+				stats.totalConnections = tomcat.getNumTotal();
+				stats.pendingThreads = remaining;
+				break;
+			case "druid":
+				DruidDataSourceStatValue poolState = druidDataSource.getStatValueAndReset();
+				stats.activeConnections = poolState.getActiveCount();
+				stats.idleConnections = poolState.getPoolingCount() - poolState.getActiveCount();
+				stats.totalConnections = poolState.getPoolingCount();
+				stats.pendingThreads = remaining;
+				break;
+			case "c3p0":
+				try {
+					stats.activeConnections = c3p0.getNumBusyConnectionsDefaultUser();
+					stats.idleConnections = c3p0.getNumIdleConnectionsDefaultUser();
+					stats.totalConnections = c3p0.getNumConnectionsDefaultUser();
+					stats.pendingThreads = remaining;
+				} catch (SQLException e) {
+					throw new RuntimeException(e);
+				}
+				break;
+			case "vibur":
+				stats.activeConnections = viburPool.getActive();
+				stats.idleConnections = viburPool.getIdle();
+				stats.totalConnections = viburPool.getTotal();
+				stats.pendingThreads = remaining;
+				break;
+		}
 
-      return stats;
-   }
+		return stats;
+	}
 
-   private long warmupPool() throws InterruptedException
-   {
-      final LongAdder j = new LongAdder();
-      ExecutorService executor = Executors.newFixedThreadPool(10);
-      for (int k = 0; k < 10; k++) {
-         executor.execute(() -> {
-            for (int i = 0; i < 100_000; i++) {
-               try (Connection connection = DS.getConnection();
-                    Statement statement = connection.createStatement();
-                    ResultSet resultSet = statement.executeQuery("SELECT x FROM faux")) {
-                  j.add(resultSet.getInt(i));
-               }
-               catch (SQLException e) {
-                  throw new RuntimeException(e);
-               }
-            }
-         });
-      }
+	private long warmupPool() throws InterruptedException {
+		final LongAdder j = new LongAdder();
+		ExecutorService executor = Executors.newFixedThreadPool(10);
+		for (int k = 0; k < 10; k++) {
+			executor.execute(() -> {
+				for (int i = 0; i < 100_000; i++) {
+					try (Connection connection = DS.getConnection();
+					     Statement statement = connection.createStatement();
+					     ResultSet resultSet = statement.executeQuery("SELECT x FROM faux")) {
+						j.add(resultSet.getInt(i));
+					} catch (SQLException e) {
+						throw new RuntimeException(e);
+					}
+				}
+			});
+		}
 
-      executor.shutdown();
-      executor.awaitTermination(60, SECONDS);
+		executor.shutdown();
+		executor.awaitTermination(60, SECONDS);
 
-      return j.sum();
-   }
+		return j.sum();
+	}
 
-   private void setupDbcp2()
-   {
-      BasicDataSource ds = new DbcpPoolAccessor();
-      ds.setUrl(jdbcUrl);
-      ds.setUsername("brettw");
-      ds.setPassword("");
-      ds.setInitialSize(MIN_POOL_SIZE);
-      ds.setMinIdle(MIN_POOL_SIZE);
-      ds.setMaxIdle(MAX_POOL_SIZE);
-      ds.setMaxTotal(MAX_POOL_SIZE);
-      ds.setMaxWaitMillis(8000);
+	private void setupDbcp2() {
+		BasicDataSource ds = new DbcpPoolAccessor();
+		ds.setUrl(jdbcUrl);
+		ds.setUsername("brettw");
+		ds.setPassword("");
+		ds.setInitialSize(MIN_POOL_SIZE);
+		ds.setMinIdle(MIN_POOL_SIZE);
+		ds.setMaxIdle(MAX_POOL_SIZE);
+		ds.setMaxTotal(MAX_POOL_SIZE);
+		ds.setMaxWaitMillis(8000);
 
-      ds.setSoftMinEvictableIdleTimeMillis(MINUTES.toMillis(10));
-      ds.setTimeBetweenEvictionRunsMillis(SECONDS.toMillis(30));
+		ds.setSoftMinEvictableIdleTimeMillis(MINUTES.toMillis(10));
+		ds.setTimeBetweenEvictionRunsMillis(SECONDS.toMillis(30));
 
-      ds.setDefaultAutoCommit(false);
-      ds.setRollbackOnReturn(true);
-      ds.setEnableAutoCommitOnReturn(false);
-      ds.setTestOnBorrow(true);
-      ds.setCacheState(true);
-      ds.setFastFailValidation(true);
+		ds.setDefaultAutoCommit(false);
+		ds.setRollbackOnReturn(true);
+		ds.setEnableAutoCommitOnReturn(false);
+		ds.setTestOnBorrow(true);
+		ds.setCacheState(true);
+		ds.setFastFailValidation(true);
 
-      try {
-         // forces internal pool creation
-         ds.getLogWriter();
-      }
-      catch (SQLException e) {
-         throw new RuntimeException(e);
-      }
+		try {
+			// forces internal pool creation
+			ds.getLogWriter();
+		} catch (SQLException e) {
+			throw new RuntimeException(e);
+		}
 
-      DS = ds;
-   }
+		DS = ds;
+	}
 
-   private void setupHikari()
-   {
-      HikariConfig config = new HikariConfig();
-      config.setJdbcUrl(jdbcUrl);
-      config.setUsername("brettw");
-      config.setPassword("");
-      config.setMinimumIdle(MIN_POOL_SIZE);
-      config.setMaximumPoolSize(MAX_POOL_SIZE);
-      config.setConnectionTimeout(8000);
-      config.setAutoCommit(false);
+	private void setupHikari() {
+		HikariConfig config = new HikariConfig();
+		config.setJdbcUrl(jdbcUrl);
+		config.setUsername("brettw");
+		config.setPassword("");
+		config.setMinimumIdle(MIN_POOL_SIZE);
+		config.setMaximumPoolSize(MAX_POOL_SIZE);
+		config.setConnectionTimeout(8000);
+		config.setAutoCommit(false);
 
-      DS = new HikariDataSource(config);
-   }
+		DS = new HikariDataSource(config);
+	}
 
-   protected void setupTomcat()
-   {
-       PoolProperties props = new PoolProperties();
-       props.setUrl(jdbcUrl);
-       props.setDriverClassName("com.zaxxer.hikari.benchmark.stubs.StubDriver");
-       props.setUsername("brettw");
-       props.setPassword("");
-       props.setInitialSize(MIN_POOL_SIZE);
-       props.setMinIdle(MIN_POOL_SIZE);
-       props.setMaxIdle(MAX_POOL_SIZE);
-       props.setMaxActive(MAX_POOL_SIZE);
-       props.setMaxWait(8000);
+	private void setupDruid() {
+		DruidDataSource dataSource = new DruidDataSource();
+		dataSource.setUrl(jdbcUrl);
+		dataSource.setUsername("brettw");
+		dataSource.setPassword("");
+		//dataSource.setDriverClassName();
+		dataSource.setMaxActive(MAX_POOL_SIZE);
+		dataSource.setInitialSize(MIN_POOL_SIZE);
+//      dataSource.setMaxWait(Integer.valueOf(PropUtil.getJdbcPropValue("jdbc.maxWait")));
+		dataSource.setMinIdle(MIN_POOL_SIZE);
+//      dataSource.setTimeBetweenEvictionRunsMillis(Integer.valueOf(PropUtil.getJdbcPropValue("jdbc.timeBetweenEvictionRunsMillis")));
+//      dataSource.setMinEvictableIdleTimeMillis(Long.valueOf(PropUtil.getJdbcPropValue("jdbc.minEvictableIdleTimeMillis")));
+		dataSource.setQueryTimeout(8000);
+		dataSource.setDefaultAutoCommit(false);
 
-       props.setDefaultAutoCommit(false);
+		DS = dataSource;
+	}
 
-       props.setRollbackOnReturn(true);
-       props.setUseDisposableConnectionFacade(true);
-       props.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.ConnectionState"); //;org.apache.tomcat.jdbc.pool.interceptor.StatementFinalizer");
-       props.setTestOnBorrow(true);
-       props.setValidationInterval(250);
-       props.setValidator(new Validator() {
-           @Override
-           public boolean validate(Connection connection, int validateAction)
-           {
-               try {
-                   return (validateAction == PooledConnection.VALIDATE_BORROW ? connection.isValid(0) : true);
-               }
-               catch (SQLException e)
-               {
-                   return false;
-               }
-           }
-       });
+	protected void setupTomcat() {
+		PoolProperties props = new PoolProperties();
+		props.setUrl(jdbcUrl);
+		props.setDriverClassName("com.zaxxer.hikari.benchmark.stubs.StubDriver");
+		props.setUsername("brettw");
+		props.setPassword("");
+		props.setInitialSize(MIN_POOL_SIZE);
+		props.setMinIdle(MIN_POOL_SIZE);
+		props.setMaxIdle(MAX_POOL_SIZE);
+		props.setMaxActive(MAX_POOL_SIZE);
+		props.setMaxWait(8000);
 
-       DS = new TomcatPoolAccessor(props);
-   }
+		props.setDefaultAutoCommit(false);
 
-   private void setupC3P0()
-   {
-      try {
-         ComboPooledDataSource cpds = new ComboPooledDataSource();
-         cpds.setJdbcUrl(jdbcUrl);
-         cpds.setUser("brettw");
-         cpds.setPassword("");
-         cpds.setAcquireIncrement(1);
-         cpds.setInitialPoolSize(MIN_POOL_SIZE);
-         cpds.setNumHelperThreads(2);
-         cpds.setMinPoolSize(MIN_POOL_SIZE);
-         cpds.setMaxPoolSize(MAX_POOL_SIZE);
-         cpds.setCheckoutTimeout(8000);
-         cpds.setLoginTimeout(8);
-         cpds.setTestConnectionOnCheckout(true);
+		props.setRollbackOnReturn(true);
+		props.setUseDisposableConnectionFacade(true);
+		props.setJdbcInterceptors("org.apache.tomcat.jdbc.pool.interceptor.ConnectionState"); //;org.apache.tomcat.jdbc.pool.interceptor.StatementFinalizer");
+		props.setTestOnBorrow(true);
+		props.setValidationInterval(250);
+		props.setValidator(new Validator() {
+			@Override
+			public boolean validate(Connection connection, int validateAction) {
+				try {
+					return (validateAction == PooledConnection.VALIDATE_BORROW ? connection.isValid(0) : true);
+				} catch (SQLException e) {
+					return false;
+				}
+			}
+		});
 
-         try (Connection connection = cpds.getConnection()) {
-            // acquire and close to poke the pool into action
-         }
+		DS = new TomcatPoolAccessor(props);
+	}
 
-         DS = cpds;
-      }
-      catch (Exception e) {
-         throw new RuntimeException(e);
-      }
-   }
+	private void setupC3P0() {
+		try {
+			ComboPooledDataSource cpds = new ComboPooledDataSource();
+			cpds.setJdbcUrl(jdbcUrl);
+			cpds.setUser("brettw");
+			cpds.setPassword("");
+			cpds.setAcquireIncrement(1);
+			cpds.setInitialPoolSize(MIN_POOL_SIZE);
+			cpds.setNumHelperThreads(2);
+			cpds.setMinPoolSize(MIN_POOL_SIZE);
+			cpds.setMaxPoolSize(MAX_POOL_SIZE);
+			cpds.setCheckoutTimeout(8000);
+			cpds.setLoginTimeout(8);
+			cpds.setTestConnectionOnCheckout(true);
 
-   private void setupVibur()
-   {
-      ViburDBCPDataSource vibur = new ViburDBCPDataSource();
-      vibur.setJdbcUrl(jdbcUrl);
-      vibur.setUsername("brettw");
-      vibur.setPassword("");
-      vibur.setPoolFair(false);
-      vibur.setPoolInitialSize(MIN_POOL_SIZE);
-      vibur.setPoolMaxSize(MAX_POOL_SIZE);
-      vibur.setDefaultAutoCommit(false);
-      vibur.setResetDefaultsAfterUse(true);
-      vibur.setConnectionIdleLimitInSeconds(30);
+			try (Connection connection = cpds.getConnection()) {
+				// acquire and close to poke the pool into action
+			}
 
-      vibur.setReducerTimeIntervalInSeconds((int) MINUTES.toSeconds(10));
+			DS = cpds;
+		} catch (Exception e) {
+			throw new RuntimeException(e);
+		}
+	}
 
-      viburPool = new ViburPoolHooks();
+	private void setupVibur() {
+		ViburDBCPDataSource vibur = new ViburDBCPDataSource();
+		vibur.setJdbcUrl(jdbcUrl);
+		vibur.setUsername("brettw");
+		vibur.setPassword("");
+		vibur.setPoolFair(false);
+		vibur.setPoolInitialSize(MIN_POOL_SIZE);
+		vibur.setPoolMaxSize(MAX_POOL_SIZE);
+		vibur.setDefaultAutoCommit(false);
+		vibur.setResetDefaultsAfterUse(true);
+		vibur.setConnectionIdleLimitInSeconds(30);
 
-      vibur.getConnHooks().addOnInit(viburPool.getInitHook());
-      vibur.getConnHooks().addOnGet(viburPool.getGetHook());
-      vibur.getConnHooks().addOnClose(viburPool.getCloseHook());
+		vibur.setReducerTimeIntervalInSeconds((int) MINUTES.toSeconds(10));
 
-      vibur.start();
+		viburPool = new ViburPoolHooks();
 
-      DS = vibur;
-   }
+		vibur.getConnHooks().addOnInit(viburPool.getInitHook());
+		vibur.getConnHooks().addOnGet(viburPool.getGetHook());
+		vibur.getConnHooks().addOnClose(viburPool.getCloseHook());
 
-   private void shutdownPool(DataSource ds)
-   {
-      if (ds instanceof AutoCloseable) {
-         try {
-            ((AutoCloseable) ds).close();
-         }
-         catch (Exception e) {
-         }
-      }
-      else if (ds instanceof ComboPooledDataSource) {
-         ((ComboPooledDataSource) ds).close();
-      }
-   }
+		vibur.start();
 
-   private static HikariPool getHikariPool(DataSource ds)
-   {
-      try {
-         Field field = ds.getClass().getDeclaredField("pool");
-         field.setAccessible(true);
-         return (HikariPool) field.get(ds);
-      }
-      catch (Exception e) {
-         throw new RuntimeException(e);
-      }
-   }
+		DS = vibur;
+	}
 
-   private static class ViburPoolHooks
-   {
-      private AtomicInteger created = new AtomicInteger();
-      private AtomicInteger active = new AtomicInteger();
+	private void shutdownPool(DataSource ds) {
+		if (ds instanceof AutoCloseable) {
+			try {
+				((AutoCloseable) ds).close();
+			} catch (Exception e) {
+			}
+		} else if (ds instanceof ComboPooledDataSource) {
+			((ComboPooledDataSource) ds).close();
+		}
+	}
 
-      int getTotal()
-      {
-         return created.get();
-      }
+	private static HikariPool getHikariPool(DataSource ds) {
+		try {
+			Field field = ds.getClass().getDeclaredField("pool");
+			field.setAccessible(true);
+			return (HikariPool) field.get(ds);
+		} catch (Exception e) {
+			throw new RuntimeException(e);
+		}
+	}
 
-      int getActive()
-      {
-         return active.get();
-      }
+	private static class ViburPoolHooks {
+		private AtomicInteger created = new AtomicInteger();
+		private AtomicInteger active = new AtomicInteger();
 
-      int getIdle()
-      {
-         return created.get() - active.get();
-      }
+		int getTotal() {
+			return created.get();
+		}
 
-      InitHook getInitHook()
-      {
-         return new InitHook();
-      }
+		int getActive() {
+			return active.get();
+		}
 
-      GetHook getGetHook()
-      {
-         return new GetHook();
-      }
+		int getIdle() {
+			return created.get() - active.get();
+		}
 
-      CloseHook getCloseHook()
-      {
-         return new CloseHook();
-      }
+		InitHook getInitHook() {
+			return new InitHook();
+		}
 
-      private class InitHook implements InitConnection
-      {
-         @Override
-         public void on(Connection rawConnection, long takenNanos) throws SQLException
-         {
-            created.incrementAndGet();
-         }
-      }
+		GetHook getGetHook() {
+			return new GetHook();
+		}
 
-      private class GetHook implements GetConnection
-      {
-         @Override
-         public void on(Connection rawConnection, long takenNanos) throws SQLException
-         {
-            active.incrementAndGet();
-         }
-      }
+		CloseHook getCloseHook() {
+			return new CloseHook();
+		}
 
-      private class CloseHook implements CloseConnection
-      {
-         @Override
-         public void on(Connection rawConnection, long takenNanos) throws SQLException
-         {
-            active.decrementAndGet();
-         }
-      }
-   }
+		private class InitHook implements InitConnection {
+			@Override
+			public void on(Connection rawConnection, long takenNanos) throws SQLException {
+				created.incrementAndGet();
+			}
+		}
+
+		private class GetHook implements GetConnection {
+			@Override
+			public void on(Connection rawConnection, long takenNanos) throws SQLException {
+				active.incrementAndGet();
+			}
+		}
+
+		private class CloseHook implements CloseConnection {
+			@Override
+			public void on(Connection rawConnection, long takenNanos) throws SQLException {
+				active.decrementAndGet();
+			}
+		}
+	}
 }
